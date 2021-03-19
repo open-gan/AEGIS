@@ -1,0 +1,9 @@
+certifi==2020.12.5
+numpy==1.20.1
+olefile==0.46
+opencv-python==4.5.1.48
+Pillow==8.1.1
+scipy==1.6.0
+torch==1.7.0
+torchaudio==0.7.0a0+ac17b64
+torchvision==0.8.0
