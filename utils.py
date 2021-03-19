@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2020/10/10 13:25
-# @Author  : Daniel Zhang
-# @Email   : zhangdan_nuaa@163.com
+# @Time    : ***
+# @Author  : ***
+# @Email   : ***
 # @File    : utils.py
-# @Software: PyCharm
+# @Software: ***
 
 
 import os
