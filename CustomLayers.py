@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2021/1/6 10:28
-# @Author  : Daniel Zhang
-# @Email   : zhangdan_nuaa@163.com
+# @Time    : ***
+# @Author  : ***
+# @Email   : ***
 # @File    : CustomLayers.py
-# @Software: PyCharm
+# @Software: ***
 
 
 import math
