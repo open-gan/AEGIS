@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2020/10/10 13:24
-# @Author  : Daniel Zhang
-# @Email   : zhangdan_nuaa@163.com
+# @Time    : ***
+# @Author  : ***
+# @Email   : ***
 # @File    : datasets.py
-# @Software: PyCharm
+# @Software: ***
 
 
 import numpy as np
