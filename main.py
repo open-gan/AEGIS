@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+# @Time    : 2020/10/10 13:23
+# @Author  : Daniel Zhang
+# @Email   : zhangdan_nuaa@163.com
+# @File    : main.py
+# @Software: PyCharm
+
+
+import argparse
+import os
+import numpy as np
+import time
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+from torchvision.utils import save_image
+import torch.nn.functional as F
+
+from datasets import *
+from utils import *
+from networks import *
+
+np.set_printoptions(suppress=True)
+torch.set_printoptions(sci_mode=False)
+# os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+
+def parse_arg():
+    parser = argparse.ArgumentParser('参数管理')
+
+    parser.add_argument('--dataroot', default="", type=str, help='data path')
+    parser.add_argument('--outfile', default='results', type=str, help='output path')
+    parser.add_argument('--noise_dim', type=int, default=512, help='latent space')
+    parser.add_argument('--batch_size', type=int, default=8, help='batch size')
+    parser.add_argument('--test_batch_size', type=int, default=8, help='test batch size')
+    parser.add_argument('--nEpochs', type=int, default=600, help='epochs')
+    parser.add_argument('--sample_step', type=int, default=1000, help='iteration for saving image')
+    parser.add_argument('--save_step', type=int, default=10, help='epoch for saving mdoel')
+
+    parser.add_argument('--channels', default="16, 32, 64, 128, 256, 512, 512, 512", type=str, help='channels for each layer')
+    parser.add_argument('--trainsize', type=int, default=29000, help='training sample')
+    parser.add_argument('--input_height', type=int, default=1024, help='input image size')
+    parser.add_argument('--input_width', type=int, default=None, help='input image size')
+    parser.add_argument('--output_height', type=int, default=1024, help='output image size')
+    parser.add_argument('--output_width', type=int, default=None, help='output image size')
+    parser.add_argument('--crop_height', type=int, default=None, help='crop image size')
+    parser.add_argument('--crop_width', type=int, default=None, help='crop image size')
+
+    parser.add_argument('--g_lr', type=float, default=0.0002, help='learning rate for generator')
+    parser.add_argument('--e_lr', type=float, default=0.0002, help='learning rate for encoder')
+    parser.add_argument('--lr_decay', type=float, default=1., help='decay')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1')
+    parser.add_argument('--beta2', type=float, default=0.9, help='beta2')
+
+    parser.add_argument('--m_plus', type=float, default=130.0, help='m in formula')
+    parser.add_argument('--weight_neg', type=float, default=0.5, help='alpha * loss_adv， alpha in formula')
+    parser.add_argument('--weight_rec', type=float, default=0.0025, help='lambda * ae_loss， lambda in formula')
+    parser.add_argument('--weight_kl', type=float, default=1., help='gamma * kl(q||p)_loss，gamma in formula')
+    parser.add_argument('--weight_logit', type=float, default=50., help='lambda')
+
+    # # parser.add_argument('--mean', type=float, default=[0.485, 0.456, 0.406], help='normalized mean')
+    # # parser.add_argument('--std', type=float, default=[0.229, 0.224, 0.225], help='normalized var')
+
+    parser.add_argument("--pretrained", default="", type=str, help="path for pre-training model")
+    parser.add_argument("--start_epoch", default=0, type=int, help="start epoch")
+    parser.add_argument("--num_vae", type=int, default=0, help="epochs for VAE pre-training")
+    parser.add_argument("--num_gan", type=int, default=10, help="epochs for GAN pre-training, without ExponentialMovingAverage")
+
+    return parser.parse_known_args()[0]
+
+
+def main():
+    config = parse_arg()
+    disp_str = ''
+    for attr in sorted(dir(config), key=lambda x: len(x)):
+        if not attr.startswith('_'):
+            disp_str += ' {} : {}\n'.format(attr, getattr(config, attr))
+    print(disp_str)
+
+    try:
+        os.makedirs(config.outfile)
+        print('mkdir:', config.outfile)
+    except OSError:
+        pass
+
+    seed = np.random.randint(0, 10000)
+    print("Random Seed: ", seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.benchmark = True
+
+    # --------------build models -------------------------
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    str_to_list = lambda x: [int(xi) for xi in x.split(',')]
+    model = AEGI(cdim=3, hdim=config.noise_dim,
+                 channels=str_to_list(config.channels), image_size=config.output_height).to(device)
+    ema = EMA(model, 0.999)
+    if config.pretrained:
+        load_model(model, ema, config.pretrained)
+    # print(model)
+
+    g_optimizer = torch.optim.Adam(model.generator.parameters(), config.g_lr, betas=(config.beta1, config.beta2))
+    e_optimizer = torch.optim.Adam(model.encoder.parameters(), config.e_lr, betas=(config.beta1, config.beta2))
+
+    # -----------------load dataset--------------------------
+    image_list = [x for x in os.listdir(config.dataroot) if is_image_file(x)]
+    train_list = image_list[:config.trainsize]
+    test_list = image_list[config.trainsize:]
+    assert len(train_list) > 0
+    assert len(test_list) >= 0
+
+    train_set = MyDataset(train_list, config.dataroot, input_height=None, crop_height=None,
+                          output_height=config.output_height, is_mirror=True)
+    test_set = MyDataset(test_list, config.dataroot, input_height=None, crop_height=None,
+                         output_height=config.output_height, is_mirror=False)
+    train_data_loader = MyDataLoader(train_set, config.batch_size)
+    test_data_loader = MyDataLoader(test_set, config.test_batch_size, shuffle=False)
+
+    fix_noise = torch.zeros(config.test_batch_size, config.noise_dim).normal_(0, 1).to(device)
+
+    start_time = time.time()
+    cur_iter = 0
+
+    def train_vae(epoch, iteration, real_images, cur_iter):
+        info = "\n====> Cur_iter: [{}]: Epoch[{}]({}/{}): time: {:4.4f}: ".format(cur_iter, epoch, iteration,
+                                                                                  len(train_data_loader),
+                                                                                  time.time() - start_time)
+
+        loss_info = '[loss_rec, loss_margin, lossE_real_kl, lossE_rec_kl, lossG_rec_kl]'
+
+        # =========== Update E ================
+        real_mu, real_logvar, real_logit, z, rec_images = model(real_images)
+
+        loss_rec = model.reconstruction_loss(rec_images, real_images, True)
+        loss_kl = model.kl_loss(real_mu, real_logvar).mean()
+
+        loss = loss_rec * config.weight_rec + \
+               loss_kl * config.weight_kl
+
+        g_optimizer.zero_grad()
+        e_optimizer.zero_grad()
+        loss.backward()
+        e_optimizer.step()
+        g_optimizer.step()
+
+        info += 'Rec: {:.4f}, KL: {:.4f}, '.format(loss_rec.item(), loss_kl.item())
+        print(info)
+
+        if cur_iter % config.sample_step == 0:
+            model.eval()
+            real_images = test_data_loader.next()
+            real_images = real_images.to(device)
+
+            mu, logvar, logit = model.encode(real_images)
+            rec_images = model.generate(mu)
+            
+            noise = torch.zeros(config.test_batch_size, config.noise_dim).normal_(0, 1).to(device)
+            fake_images = model.sample(noise)
+            fix_fake_images = model.sample(fix_noise)
+
+            save_image(torch.cat([real_images, rec_images, fake_images, fix_fake_images], dim=0).data.cpu(),
+                       '{}/image_{}.jpg'.format(config.outfile, cur_iter), nrow=config.test_batch_size // 2)
+            model.train()
+
+    def train(epoch, iteration, real_images, cur_iter):
+        info = "\n====> Cur_iter: [{}]: Epoch[{}]({}/{}): time: {:4.4f}: ".format(cur_iter, epoch, iteration,
+                                                                                  len(train_data_loader),
+                                                                                  time.time() - start_time)
+
+        loss_info = '[loss_rec, loss_margin, lossE_real_kl, lossE_rec_kl, lossG_rec_kl]'
+        
+        noise = torch.zeros(config.batch_size, config.noise_dim).normal_(0, 1).to(device)
+
+        # =========== Update E ================
+        real_mu, real_logvar, real_logit = model.encode(real_images)
+        z, eps = model.reparameterize(real_mu, real_logvar)
+        rec_images = model.generate(z)
+        fake_images = model.generate(noise)
+        rec_mu, rec_logvar, rec_logit = model.encode(rec_images.detach())
+        fake_mu, fake_logvar, fake_logit = model.encode(fake_images.detach())
+
+        _lossE_logistic, gp = model.D_logistic_r1(real_logit, fake_logit, real_images, device)
+        if iteration % 4 == 0:
+            _lossE_logistic = _lossE_logistic + gp
+        lossE_logistic = _lossE_logistic.mean()
+
+        loss_rec = model.reconstruction_loss(rec_images, real_images, True)
+        lossE_real_kl = model.kl_loss(real_mu, real_logvar).mean()
+        _lossE_rec_kl = model.kl_loss(rec_mu, rec_logvar)
+        _lossE_fake_kl = model.kl_loss(fake_mu, fake_logvar)
+        lossE_rec_kl = F.relu(config.m_plus - _lossE_rec_kl).mean()
+        lossE_fake_kl = F.relu(config.m_plus - _lossE_fake_kl).mean()
+
+        loss_margin = lossE_real_kl + (lossE_rec_kl + lossE_fake_kl) * 0.5 * config.weight_neg + lossE_logistic * config.weight_logit
+
+        lossE = loss_rec * config.weight_rec + \
+                loss_margin * config.weight_kl
+        e_optimizer.zero_grad()
+        lossE.backward()
+        e_optimizer.step()
+
+        # ========= Update G ==================
+        real_mu, real_logvar, real_logit = model.encode(real_images)
+        z_g, _ = model.reparameterize(real_mu, real_logvar, eps)
+        rec_images = model.generate(z.detach())
+        rec_images_g = model.generate(z_g)
+        fake_images = model.generate(noise)
+        rec_mu, rec_logvar, rec_logit = model.encode(rec_images)
+        fake_mu, fake_logvar, fake_logit = model.encode(fake_images)
+
+        loss_rec = model.reconstruction_loss(rec_images_g, real_images, True)
+        lossG_logistic = model.G_logistic_nonsaturating(fake_logit)
+        lossG_rec_kl = model.kl_loss(rec_mu, rec_logvar).mean()
+        lossG_fake_kl = model.kl_loss(fake_mu, fake_logvar).mean()
+
+        lossG = loss_rec * config.weight_rec + (lossG_rec_kl + lossG_fake_kl) * 0.5 * config.weight_neg * config.weight_kl + lossG_logistic * config.weight_logit
+
+        g_optimizer.zero_grad()
+        lossG.backward()
+        g_optimizer.step()
+
+        if epoch >= (config.num_vae + config.num_gan):
+            ema.update()
+
+        info += 'Rec: {:.4f}, '.format(loss_rec.item())
+        info += 'E_logit: {:.4f}, D_logit: {:.4f}, '.format(lossE_logistic.item(), lossG_logistic.item())
+        info += 'Kl_E: real {:.4f}, rec {:.4f}, fake {:.4f}, '.format(lossE_real_kl.item(), _lossE_rec_kl.mean().item(), _lossE_fake_kl.mean().item())
+        info += 'Kl_G: rec {:.4f}, fake {:.4f}, '.format(lossG_rec_kl.item(), lossG_fake_kl.item())
+        print(info)
+
+        if cur_iter % config.sample_step == 0:
+            model.eval()
+            if epoch >= (config.num_vae + config.num_gan):
+                ema.apply_shadow()
+
+            real_images = test_data_loader.next()
+            real_images = real_images.to(device)
+
+            mu, logvar, logit = model.encode(real_images)
+            rec_images = model.generate(mu)
+
+            noise = torch.zeros(config.test_batch_size, config.noise_dim).normal_(0, 1).to(device)
+            fake_images = model.sample(noise)
+            fix_fake_images = model.sample(fix_noise)
+
+            save_image(torch.cat([real_images, rec_images, fake_images, fix_fake_images], dim=0).data.cpu(),
+                       '{}/image_{}.jpg'.format(config.outfile, cur_iter), nrow=config.test_batch_size // 1)
+
+            model.train()
+            if epoch >= (config.num_vae + config.num_gan):
+                ema.restore()
+
+    for epoch in range(config.start_epoch, config.nEpochs + 1):
+        model.train()
+        for iteration, real_images in enumerate(train_data_loader.get_iter()):
+            real_images = real_images.to(device).requires_grad_(True)
+            # --------------train------------
+            if epoch < config.num_vae:
+                train_vae(epoch, iteration, real_images, cur_iter)
+            else:
+                if epoch == (config.num_vae + config.num_gan):
+                    ema.register()
+                train(epoch, iteration, real_images, cur_iter)
+
+            cur_iter += 1
+
+        # save models
+        if epoch % config.save_step == config.save_step - 1:
+            save_checkpoint(model, ema, epoch, 0, '')
+
+
+if __name__ == "__main__":
+    main()
